@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(chmod:*)",
+      "Bash(adb:*)",
+      "Bash(timeout:*)",
+      "Bash(gtimeout:*)",
+      "Bash(source:*)",
+      "Bash(get_network_stats)",
+      "Bash(grep:*)",
+      "Bash(./test_monitor.sh)"
+    ],
+    "deny": []
+  }
+}
