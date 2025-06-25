@@ -8,7 +8,10 @@
       "Bash(source:*)",
       "Bash(get_network_stats)",
       "Bash(grep:*)",
-      "Bash(./test_monitor.sh)"
+      "Bash(./test_monitor.sh)",
+      "Bash(./adb_traffic_monitor.sh:*)",
+      "Bash(bash:*)",
+      "Bash(cat /tmp/adb_debug.log)"
     ],
     "deny": []
   }

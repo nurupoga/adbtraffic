@@ -29,47 +29,124 @@ warn() {
     echo -e "${YELLOW}[WARN]${NC} $*" >&2
 }
 
+SELECTED_DEVICE=""
+
+select_device() {
+    local device_list=$(adb devices | grep "device$" | cut -f1)
+    local devices=($device_list)
+    local device_count=${#devices[@]}
+    
+    if [ "$device_count" -eq 0 ]; then
+        error "No ADB devices connected. Please connect your Android device."
+        exit 1
+    elif [ "$device_count" -eq 1 ]; then
+        SELECTED_DEVICE=${devices[0]}
+        log "Using device: $SELECTED_DEVICE"
+        return
+    fi
+    
+    echo -e "${BLUE}Multiple devices detected:${NC}"
+    for i in "${!devices[@]}"; do
+        local device_info=$(adb -s "${devices[$i]}" shell getprop ro.product.model 2>/dev/null || echo "Unknown device")
+        echo -e "${YELLOW}$((i+1)).${NC} ${devices[$i]} ($device_info)"
+    done
+    echo
+    
+    while true; do
+        read -p "Select device number (1-$device_count): " selection
+        if [[ "$selection" =~ ^[0-9]+$ ]] && [ "$selection" -ge 1 ] && [ "$selection" -le "$device_count" ]; then
+            SELECTED_DEVICE=${devices[$((selection-1))]}
+            log "Selected device: $SELECTED_DEVICE"
+            break
+        else
+            error "Invalid selection. Please enter a number between 1 and $device_count."
+        fi
+    done
+}
+
 check_adb_connection() {
     if ! command -v adb &> /dev/null; then
         error "ADB command not found. Please install Android SDK platform-tools."
         exit 1
     fi
     
-    local devices=$(adb devices | grep -c "device$" || true)
-    if [ "$devices" -eq 0 ]; then
-        error "No ADB devices connected. Please connect your Android device."
-        exit 1
-    elif [ "$devices" -gt 1 ]; then
-        warn "Multiple devices detected. Using the first one."
-    fi
-    
+    select_device
     log "ADB device connected successfully"
 }
 
 get_network_stats() {
-    local net_data=$(adb shell cat /proc/net/dev 2>/dev/null || echo "")
+    local net_data=$(adb -s "$SELECTED_DEVICE" shell cat /proc/net/dev 2>/dev/null || echo "")
     local rx_bytes=0
     local tx_bytes=0
+    local active_interface=""
     
-    # Try to find active interfaces in order of preference
-    for interface in wlan0 wlan1 rmnet1 eth0; do
+    # Extended list of mobile network interfaces (prioritize active ones first)
+    local mobile_interfaces="rmnet1 rmnet_data0 rmnet_data1 rmnet_data2 rmnet_data3 rmnet_data4 rmnet_data5 rmnet_data6 rmnet_data7 rmnet0 rmnet2 rmnet3 rmnet4 rmnet5 rmnet6 rmnet7 ccmni0 ccmni1 ccmni2 ccmni3 pdp_ip0 pdp_ip1 pdp_ip2 ppp0 rndis0"
+    local wifi_interfaces="wlan0 wlan1 wlan2"
+    local other_interfaces="eth0 eth1 usb0"
+    
+    # Function to check interface and extract stats
+    check_interface() {
+        local interface=$1
         local line=$(echo "$net_data" | grep "^ *$interface:" || echo "")
         if [ -n "$line" ]; then
             local temp_rx=$(echo "$line" | awk '{print $2}')
             local temp_tx=$(echo "$line" | awk '{print $10}')
-            if [ "$temp_rx" -gt 0 ] || [ "$temp_tx" -gt 0 ]; then
+            # Check if interface has meaningful traffic (not just initialization bytes)
+            if [ "$temp_rx" -gt 1000 ] || [ "$temp_tx" -gt 1000 ]; then
                 rx_bytes=$temp_rx
                 tx_bytes=$temp_tx
-                break
+                active_interface=$interface
+                return 0
             fi
+        fi
+        return 1
+    }
+    
+    # Try mobile interfaces first (may be more active)
+    for interface in $mobile_interfaces; do
+        if check_interface "$interface"; then
+            break
         fi
     done
     
-    # Fallback: sum all active interfaces
+    # If no mobile found, try Wi-Fi interfaces
     if [ "$rx_bytes" -eq 0 ] && [ "$tx_bytes" -eq 0 ]; then
-        rx_bytes=$(echo "$net_data" | grep -E "wlan|rmnet|eth" | awk '{rx+=$2; tx+=$10} END {print rx+0}')
-        tx_bytes=$(echo "$net_data" | grep -E "wlan|rmnet|eth" | awk '{rx+=$2; tx+=$10} END {print tx+0}')
+        for interface in $wifi_interfaces; do
+            if check_interface "$interface"; then
+                break
+            fi
+        done
     fi
+    
+    # Try other interfaces as fallback
+    if [ "$rx_bytes" -eq 0 ] && [ "$tx_bytes" -eq 0 ]; then
+        for interface in $other_interfaces; do
+            if check_interface "$interface"; then
+                break
+            fi
+        done
+    fi
+    
+    # Last resort: use /proc/net/xt_qtaguid/stats if available (Android-specific)
+    if [ "$rx_bytes" -eq 0 ] && [ "$tx_bytes" -eq 0 ]; then
+        local qtaguid_data=$(adb -s "$SELECTED_DEVICE" shell cat /proc/net/xt_qtaguid/stats 2>/dev/null | tail -n +2 || echo "")
+        if [ -n "$qtaguid_data" ]; then
+            rx_bytes=$(echo "$qtaguid_data" | awk '{rx+=$6} END {print rx+0}')
+            tx_bytes=$(echo "$qtaguid_data" | awk '{tx+=$8} END {print tx+0}')
+            active_interface="qtaguid"
+        fi
+    fi
+    
+    # Final fallback: sum all interfaces with significant traffic
+    if [ "$rx_bytes" -eq 0 ] && [ "$tx_bytes" -eq 0 ]; then
+        rx_bytes=$(echo "$net_data" | grep -E ":" | awk '$2 > 1000 {rx+=$2} END {print rx+0}')
+        tx_bytes=$(echo "$net_data" | grep -E ":" | awk '$10 > 1000 {tx+=$10} END {print tx+0}')
+        active_interface="aggregated"
+    fi
+    
+    # Store active interface for debugging
+    echo "ACTIVE_INTERFACE=$active_interface" > /tmp/adb_traffic_debug 2>/dev/null || true
     
     echo "$rx_bytes $tx_bytes"
 }
@@ -139,9 +216,16 @@ display_traffic() {
         tx_speed=${tx_history[$last_index]}
     fi
     
+    # Show active interface for debugging
+    local active_interface="unknown"
+    if [ -f /tmp/adb_traffic_debug ]; then
+        active_interface=$(grep "ACTIVE_INTERFACE" /tmp/adb_traffic_debug 2>/dev/null | cut -d'=' -f2 || echo "unknown")
+    fi
+    
     echo -e "${GREEN}Time: $current_time${NC}"
     echo -e "${GREEN}Download: $(format_bytes $rx_speed)${NC}"
     echo -e "${RED}Upload:   $(format_bytes $tx_speed)${NC}"
+    echo -e "${YELLOW}Interface: $active_interface${NC}"
     echo
     
     if [ ${#rx_history[@]} -gt 0 ]; then
@@ -171,18 +255,20 @@ main() {
     
     # Get initial values
     local stats=$(get_network_stats)
-    prev_rx_bytes=$(echo $stats | cut -d' ' -f1)
-    prev_tx_bytes=$(echo $stats | cut -d' ' -f2)
+    prev_rx_bytes=$(echo "$stats" | cut -d' ' -f1)
+    prev_tx_bytes=$(echo "$stats" | cut -d' ' -f2)
+    
     
     sleep 1
     
     while true; do
         local stats=$(get_network_stats)
-        local current_rx_bytes=$(echo $stats | cut -d' ' -f1)
-        local current_tx_bytes=$(echo $stats | cut -d' ' -f2)
+        local current_rx_bytes=$(echo "$stats" | cut -d' ' -f1)
+        local current_tx_bytes=$(echo "$stats" | cut -d' ' -f2)
         
         local rx_speed=$(( current_rx_bytes - prev_rx_bytes ))
         local tx_speed=$(( current_tx_bytes - prev_tx_bytes ))
+        
         
         if [ "$rx_speed" -lt 0 ]; then rx_speed=0; fi
         if [ "$tx_speed" -lt 0 ]; then tx_speed=0; fi
